@@ -1,14 +1,14 @@
 """
-BTC/USDT 15m Prediction API — v2 (improved accuracy)
-======================================================
-Changes from v1:
-- 5000 candles (~52 days) instead of 2000
-- Stricter target threshold 0.0003 (filters flat noise candles)
-- Drops low-signal candles (vol_ratio < 0.5) from training
-- Added features: rel_size, gap, trend_strength
-- LightGBM: is_unbalance=True, tuned params
-- Prints feature importances to Railway logs
-- Cache TTL reduced to 5 minutes
+BTC/USDT 15m Prediction API — v3
+=================================
+Fixes from v2:
+- Removed early stopping (was killing learning)
+- Simpler trees (num_leaves=15) to reduce overfitting
+- Lower learning rate (0.01) for more thorough learning
+- More trees (1000) to compensate for lower LR
+- Removed vol_ratio filter (was removing too many rows)
+- Looser threshold back to 0.0002 (better sample balance)
+- Added print of class counts per fold for debugging
 """
 
 from fastapi import FastAPI, HTTPException
@@ -26,7 +26,7 @@ import time
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="BTC 15m Predictor", version="2.0.0")
+app = FastAPI(title="BTC 15m Predictor", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,9 +36,9 @@ app.add_middleware(
 )
 
 _cache: dict = {"model": None, "features": None, "trained_at": 0, "ind": None}
-CACHE_TTL = 60 * 5      # retrain every 5 minutes
-FETCH_LIMIT = 5000      # ~52 days of 15m candles
-THRESHOLD = 0.0003      # stricter: filter flat candles
+CACHE_TTL  = 60 * 5
+FETCH_LIMIT = 5000
+THRESHOLD  = 0.0002
 
 
 class Candle(BaseModel):
@@ -67,7 +67,7 @@ class PredictResponse(BaseModel):
 
 def fetch_binance(limit: int = FETCH_LIMIT) -> pd.DataFrame:
     url = "https://api.binance.com/api/v3/klines"
-    r = requests.get(url, params={"symbol": "BTCUSDT", "interval": "15m", "limit": limit}, timeout=10)
+    r = requests.get(url, params={"symbol": "BTCUSDT", "interval": "15m", "limit": limit}, timeout=15)
     r.raise_for_status()
     raw = r.json()
     df = pd.DataFrame(raw, columns=[
@@ -80,66 +80,60 @@ def fetch_binance(limit: int = FETCH_LIMIT) -> pd.DataFrame:
     return df.set_index("open_time").sort_index()
 
 
-# ── Feature engineering ───────────────────────────────────────────────────────
+# ── Features ──────────────────────────────────────────────────────────────────
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     f = pd.DataFrame(index=df.index)
     o, h, l, c, v = df["open"], df["high"], df["low"], df["close"], df["volume"]
 
     # Candle shape
-    f["body"]        = (c - o) / o
-    f["upper_wick"]  = (h - c.clip(lower=o)) / (h - l + 1e-9)
-    f["lower_wick"]  = (c.clip(upper=o) - l) / (h - l + 1e-9)
-    f["hl_range"]    = (h - l) / o
-
-    # NEW: relative candle size vs recent average
-    f["rel_size"]    = (h - l) / ((h - l).rolling(20).mean() + 1e-9)
-
-    # NEW: gap from previous close to current open
-    f["gap"]         = (o - c.shift(1)) / (c.shift(1) + 1e-9)
-
-    # NEW: trend strength (how directional vs noisy recent moves are)
+    f["body"]           = (c - o) / o
+    f["upper_wick"]     = (h - c.clip(lower=o)) / (h - l + 1e-9)
+    f["lower_wick"]     = (c.clip(upper=o) - l) / (h - l + 1e-9)
+    f["hl_range"]       = (h - l) / o
+    f["rel_size"]       = (h - l) / ((h - l).rolling(20).mean() + 1e-9)
+    f["gap"]            = (o - c.shift(1)) / (c.shift(1) + 1e-9)
     f["trend_strength"] = abs(c - c.shift(20)) / ((h - l).rolling(20).mean() * 20 + 1e-9)
 
     # Lagged returns
     for n in [1, 2, 3, 5, 8, 13]:
-        f[f"ret_{n}"] = c.pct_change(n)
+        f[f"ret_{n}"]   = c.pct_change(n)
 
     # Volume
-    f["vol_ratio"]   = v / v.rolling(20).mean()
-    f["buy_ratio"]   = df["taker_buy_base"] / (v + 1e-9)
-    f["vol_trend"]   = v.pct_change(5)
+    f["vol_ratio"]      = v / v.rolling(20).mean()
+    f["buy_ratio"]      = df["taker_buy_base"] / (v + 1e-9)
+    f["vol_trend"]      = v.pct_change(5)
 
-    # Trend: EMA distances
+    # EMA distances
     for n in [8, 21, 55]:
         f[f"dist_ema{n}"] = (c - c.ewm(span=n).mean()) / c
 
     # Momentum
-    f["rsi"]         = ta.momentum.RSIIndicator(c, window=14).rsi() / 100
+    f["rsi"]            = ta.momentum.RSIIndicator(c, window=14).rsi() / 100
     stoch = ta.momentum.StochasticOscillator(h, l, c, window=14, smooth_window=3)
-    f["stoch_k"]     = stoch.stoch() / 100
-    f["stoch_d"]     = stoch.stoch_signal() / 100
+    f["stoch_k"]        = stoch.stoch() / 100
+    f["stoch_d"]        = stoch.stoch_signal() / 100
     macd = ta.trend.MACD(c, window_slow=26, window_fast=12, window_sign=9)
-    f["macd"]        = macd.macd() / c
-    f["macd_signal"] = macd.macd_signal() / c
-    f["macd_diff"]   = macd.macd_diff() / c
+    f["macd"]           = macd.macd() / c
+    f["macd_signal"]    = macd.macd_signal() / c
+    f["macd_diff"]      = macd.macd_diff() / c
 
     # Volatility
     bb = ta.volatility.BollingerBands(c, window=20, window_dev=2)
-    f["bb_pct"]      = bb.bollinger_pband()
-    f["bb_width"]    = bb.bollinger_wband() / c
-    f["atr"]         = ta.volatility.AverageTrueRange(h, l, c, window=14).average_true_range() / c
+    f["bb_pct"]         = bb.bollinger_pband()
+    f["bb_width"]       = bb.bollinger_wband() / c
+    f["atr"]            = ta.volatility.AverageTrueRange(h, l, c, window=14).average_true_range() / c
 
     # Volume-price
-    f["obv_change"]  = ta.volume.OnBalanceVolumeIndicator(c, v).on_balance_volume().pct_change(5)
+    f["obv_change"]     = ta.volume.OnBalanceVolumeIndicator(c, v).on_balance_volume().pct_change(5)
 
-    # Time features
-    f["hour"]        = df.index.hour / 23
-    f["day_of_week"] = df.index.dayofweek / 6
+    # Time
+    f["hour"]           = df.index.hour / 23
+    f["day_of_week"]    = df.index.dayofweek / 6
 
     # Rolling stats
-    f["ret_std_20"]  = c.pct_change().rolling(20).std()
-    f["ret_skew_20"] = c.pct_change().rolling(20).skew()
+    f["ret_std_20"]     = c.pct_change().rolling(20).std()
+    f["ret_skew_20"]    = c.pct_change().rolling(20).skew()
 
     return f
 
@@ -151,7 +145,6 @@ def build_target(df: pd.DataFrame) -> pd.Series:
     t = pd.Series(np.nan, index=df.index)
     t[future >  THRESHOLD] = 1
     t[future < -THRESHOLD] = 0
-    # flat candles left as NaN → dropped later
     return t
 
 
@@ -162,54 +155,53 @@ def train_model(df: pd.DataFrame):
     target   = build_target(df)
     data     = features.join(target.rename("target")).dropna()
 
-    # Drop low-volume noise candles
-    if "vol_ratio" in data.columns:
-        data = data[data["vol_ratio"] >= 0.5]
-
     X = data.drop(columns=["target"])
     y = data["target"].astype(int)
 
-    print(f"Training on {len(X)} samples | UP: {y.sum()} | DOWN: {(1-y).sum()}", flush=True)
+    print(f"Total samples: {len(X)} | UP: {y.sum()} ({y.mean()*100:.1f}%) | DOWN: {(1-y).sum()} ({(1-y.mean())*100:.1f}%)", flush=True)
 
     params = dict(
         objective="binary",
         metric="binary_logloss",
-        learning_rate=0.05,
-        num_leaves=31,
-        min_child_samples=20,
-        n_estimators=300,
+        learning_rate=0.01,
+        num_leaves=15,
+        min_child_samples=10,
+        n_estimators=1000,
         is_unbalance=True,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        reg_alpha=0.05,
+        reg_lambda=0.5,
         verbose=-1,
         n_jobs=-1,
     )
 
     accs, model = [], None
-    for train_idx, val_idx in TimeSeriesSplit(n_splits=5).split(X):
+    for fold, (train_idx, val_idx) in enumerate(TimeSeriesSplit(n_splits=5).split(X), 1):
         X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
         y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        print(f"Fold {fold}: train={len(X_tr)} val={len(X_val)} UP%={y_tr.mean()*100:.1f}", flush=True)
         m = lgb.LGBMClassifier(**params)
-        m.fit(X_tr, y_tr,
-              eval_set=[(X_val, y_val)],
-              callbacks=[lgb.early_stopping(50, verbose=False),
-                         lgb.log_evaluation(period=-1)])
+        m.fit(X_tr, y_tr)   # no early stopping — let it train fully
         preds = m.predict(X_val)
-        accs.append((preds == y_val.values).mean())
+        acc = (preds == y_val.values).mean()
+        accs.append(acc)
+        print(f"Fold {fold} accuracy: {acc*100:.1f}%", flush=True)
         model = m
 
-    # Print feature importances to Railway logs
+    # Feature importances
     importances = sorted(zip(X.columns, model.feature_importances_),
                          key=lambda kv: kv[1], reverse=True)
     print("=== FEATURE IMPORTANCES ===", flush=True)
     for name, imp in importances:
-        print(f"  {name:24s} {imp}", flush=True)
-    print(f"=== CV ACCURACY: {np.mean(accs)*100:.1f}% ===", flush=True)
+        bar = "█" * min(int(imp / max(v for _, v in importances) * 20), 20)
+        print(f"  {name:24s} {bar} {imp}", flush=True)
+
+    mean_acc = float(np.mean(accs))
+    print(f"=== CV ACCURACY: {mean_acc*100:.1f}% ===", flush=True)
 
     last_features = features.dropna().iloc[[-1]]
-    return model, last_features, float(np.mean(accs))
+    return model, last_features, mean_acc
 
 
 # ── Indicators summary ────────────────────────────────────────────────────────
@@ -252,7 +244,7 @@ def make_reasoning(ind: dict, direction: str) -> str:
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "BTC 15m Predictor", "version": "2.0.0"}
+    return {"status": "ok", "service": "BTC 15m Predictor", "version": "3.0.0"}
 
 
 @app.get("/predict", response_model=PredictResponse)
