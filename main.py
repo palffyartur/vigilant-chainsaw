@@ -1,14 +1,9 @@
 """
-BTC/USDT 15m Prediction API — v3
+BTC/USDT 15m Prediction API — v4
 =================================
-Fixes from v2:
-- Removed early stopping (was killing learning)
-- Simpler trees (num_leaves=15) to reduce overfitting
-- Lower learning rate (0.01) for more thorough learning
-- More trees (1000) to compensate for lower LR
-- Removed vol_ratio filter (was removing too many rows)
-- Looser threshold back to 0.0002 (better sample balance)
-- Added print of class counts per fold for debugging
+Fixes from v3:
+- Threshold dropped to 0.00005 (keeps ~3800 samples vs 819)
+- min_child_samples=50 to handle larger dataset properly
 """
 
 from fastapi import FastAPI, HTTPException
@@ -26,7 +21,7 @@ import time
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="BTC 15m Predictor", version="3.0.0")
+app = FastAPI(title="BTC 15m Predictor", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,9 +31,9 @@ app.add_middleware(
 )
 
 _cache: dict = {"model": None, "features": None, "trained_at": 0, "ind": None}
-CACHE_TTL  = 60 * 5
+CACHE_TTL   = 60 * 5
 FETCH_LIMIT = 5000
-THRESHOLD  = 0.0002
+THRESHOLD   = 0.00005   # very loose — keeps ~80% of candles
 
 
 class Candle(BaseModel):
@@ -165,7 +160,7 @@ def train_model(df: pd.DataFrame):
         metric="binary_logloss",
         learning_rate=0.01,
         num_leaves=15,
-        min_child_samples=10,
+        min_child_samples=50,
         n_estimators=1000,
         is_unbalance=True,
         subsample=0.7,
@@ -182,7 +177,7 @@ def train_model(df: pd.DataFrame):
         y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
         print(f"Fold {fold}: train={len(X_tr)} val={len(X_val)} UP%={y_tr.mean()*100:.1f}", flush=True)
         m = lgb.LGBMClassifier(**params)
-        m.fit(X_tr, y_tr)   # no early stopping — let it train fully
+        m.fit(X_tr, y_tr)
         preds = m.predict(X_val)
         acc = (preds == y_val.values).mean()
         accs.append(acc)
@@ -193,8 +188,9 @@ def train_model(df: pd.DataFrame):
     importances = sorted(zip(X.columns, model.feature_importances_),
                          key=lambda kv: kv[1], reverse=True)
     print("=== FEATURE IMPORTANCES ===", flush=True)
+    top_val = max(v for _, v in importances) or 1
     for name, imp in importances:
-        bar = "█" * min(int(imp / max(v for _, v in importances) * 20), 20)
+        bar = "█" * int(imp / top_val * 20)
         print(f"  {name:24s} {bar} {imp}", flush=True)
 
     mean_acc = float(np.mean(accs))
@@ -244,7 +240,7 @@ def make_reasoning(ind: dict, direction: str) -> str:
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "BTC 15m Predictor", "version": "3.0.0"}
+    return {"status": "ok", "service": "BTC 15m Predictor", "version": "4.0.0"}
 
 
 @app.get("/predict", response_model=PredictResponse)
